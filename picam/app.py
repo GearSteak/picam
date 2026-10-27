@@ -54,13 +54,14 @@ class App:
         self.camera.rotation = int(prefs.get("rotation") or 0)
         self.root = tk.Tk()
         self.root.title(f"Pi Cam {running_revision()}")
-        self.root.geometry("960x720")
-        self.root.minsize(720, 580)
+        self.root.geometry("1024x780")
+        self.root.minsize(800, 640)
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         self._jobs: queue.Queue = queue.Queue()
         self._photo_ref: ImageTk.PhotoImage | None = None
+        self._last_preview: Image.Image | None = None
         self._preview_running = False
         self._gb_live = False
         self._gb_lcd = bool(prefs.get("gb_lcd", True))
@@ -68,14 +69,39 @@ class App:
         self._pano_mode = False
         self._status_var = tk.StringVar(value="Starting camera…")
         self._mode_var = tk.StringVar(value="Live")
+        self._preview_message = "Opening camera…"
 
         self._build()
         self.root.after(100, self._pump)
         threading.Thread(target=self._boot_camera, daemon=True).start()
 
     def _build(self) -> None:
-        header = tk.Frame(self.root, bg=FIELD, padx=12, pady=10)
-        header.pack(fill="x")
+        # Pack bottom chrome first so the preview keeps the tall middle.
+        status_bar = tk.Frame(self.root, bg=PANEL)
+        status_bar.pack(fill="x", side="bottom")
+        tk.Label(
+            status_bar,
+            textvariable=self._status_var,
+            bg=PANEL,
+            fg=MUTED,
+            anchor="w",
+            padx=12,
+            pady=6,
+            font=ui_font(10),
+        ).pack(side="left", fill="x", expand=True)
+        tk.Label(
+            status_bar,
+            textvariable=self._mode_var,
+            bg=PANEL,
+            fg=ACCENT,
+            anchor="e",
+            padx=12,
+            pady=6,
+            font=ui_font(10, True),
+        ).pack(side="right")
+
+        header = tk.Frame(self.root, bg=FIELD, padx=12, pady=8)
+        header.pack(fill="x", side="top")
         tk.Label(header, text="Pi Cam", bg=FIELD, fg=INK, font=ui_font(18, True)).pack(side="left")
         self.update_btn = tk.Button(
             header,
@@ -93,19 +119,20 @@ class App:
         self.update_btn.pack(side="right")
         self.backend_label = tk.Label(header, text="", bg=FIELD, fg=MUTED, font=ui_font(10))
         self.backend_label.pack(side="right", padx=(0, 10))
-
-        tk.Frame(self.root, bg=LINE, height=1).pack(fill="x")
+        tk.Frame(self.root, bg=LINE, height=1).pack(fill="x", side="top")
 
         body = tk.Frame(self.root, bg=BG)
-        body.pack(fill="both", expand=True, padx=12, pady=12)
-
-        preview_wrap = tk.Frame(body, bg=PANEL, highlightthickness=1, highlightbackground=LINE)
-        preview_wrap.pack(fill="both", expand=True)
-        self.preview = tk.Label(preview_wrap, text="Opening camera…", bg="#111", fg="#ddd", font=ui_font(12))
-        self.preview.pack(fill="both", expand=True, padx=2, pady=2)
+        body.pack(fill="both", expand=True, padx=12, pady=10)
 
         tools = tk.Frame(body, bg=BG)
-        tools.pack(fill="x", pady=(12, 0))
+        tools.pack(fill="x", side="bottom", pady=(10, 0))
+
+        preview_wrap = tk.Frame(body, bg="#111", highlightthickness=1, highlightbackground=LINE)
+        preview_wrap.pack(fill="both", expand=True)
+        # Canvas letterboxes the frame so 16:9 / 4:3 never becomes a thin strip.
+        self.preview = tk.Canvas(preview_wrap, bg="#111", highlightthickness=0)
+        self.preview.pack(fill="both", expand=True)
+        self.preview.bind("<Configure>", lambda _e: self._redraw_preview())
 
         def btn(parent, text, cmd, *, primary=False, danger=False):
             return tk.Button(
@@ -117,9 +144,9 @@ class App:
                 activebackground="#0066d6" if primary else (SELECT if not danger else "#a93226"),
                 activeforeground=MINE_INK if (primary or danger) else INK,
                 relief="flat",
-                padx=12,
-                pady=8,
-                font=ui_font(11, True),
+                padx=10,
+                pady=5,
+                font=ui_font(10, True),
             )
 
         row1 = tk.Frame(tools, bg=BG)
@@ -131,7 +158,7 @@ class App:
         btn(row1, "Open folder", self.open_folder).pack(side="right")
 
         row2 = tk.Frame(tools, bg=BG)
-        row2.pack(fill="x", pady=(8, 0))
+        row2.pack(fill="x", pady=(6, 0))
         self.rotate_btn = btn(row2, self._rotate_label(), self.rotate_image)
         self.rotate_btn.pack(side="left")
         self.gb_live_btn = btn(row2, "GB live: off", self.toggle_gb_live)
@@ -144,28 +171,6 @@ class App:
         self.pano_snap_btn.pack(side="left", padx=(8, 0))
         self.pano_snap_btn.configure(state="disabled")
         btn(row2, "Finish pano", self.finish_pano).pack(side="left", padx=(8, 0))
-
-        status = tk.Label(
-            self.root,
-            textvariable=self._status_var,
-            bg=PANEL,
-            fg=MUTED,
-            anchor="w",
-            padx=12,
-            pady=8,
-            font=ui_font(10),
-        )
-        status.pack(fill="x", side="bottom")
-        mode = tk.Label(
-            self.root,
-            textvariable=self._mode_var,
-            bg=PANEL,
-            fg=ACCENT,
-            anchor="e",
-            padx=12,
-            font=ui_font(10, True),
-        )
-        mode.place(relx=1.0, rely=1.0, x=-12, y=-10, anchor="se")
 
     def _rotate_label(self) -> str:
         return f"Rotate: {int(self.camera.rotation) % 360}°"
@@ -190,9 +195,9 @@ class App:
         self.backend_label.configure(text=f"{info.backend} · {info.detail}")
         if info.backend == "none":
             self._status_var.set(info.detail)
-            self.preview.configure(
-                text=info.detail + "\n\nOn the Pi run: bash install.sh"
-            )
+            self._preview_message = info.detail + "\n\nOn the Pi run: bash install.sh"
+            self._last_preview = None
+            self._redraw_preview()
             return
         self._status_var.set(f"Camera ready · rotation {self.camera.rotation}°")
         self._preview_running = True
@@ -221,16 +226,39 @@ class App:
         self.root.after(33, self._tick_preview)
 
     def _show_frame(self, image: Image.Image) -> None:
-        self.preview.update_idletasks()
-        mw = max(self.preview.winfo_width() - 8, 320)
-        mh = max(self.preview.winfo_height() - 8, 240)
+        self._last_preview = image.convert("RGB")
+        self._preview_message = ""
+        self._redraw_preview()
+
+    def _redraw_preview(self) -> None:
+        canvas = self.preview
+        canvas.update_idletasks()
+        cw = max(canvas.winfo_width(), 2)
+        ch = max(canvas.winfo_height(), 2)
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, cw, ch, fill="#111", outline="")
+        image = getattr(self, "_last_preview", None)
+        if image is None:
+            if self._preview_message:
+                canvas.create_text(
+                    cw // 2,
+                    ch // 2,
+                    text=self._preview_message,
+                    fill="#ddd",
+                    font=ui_font(12),
+                    justify="center",
+                    width=max(cw - 40, 100),
+                )
+            return
         w, h = image.size
-        scale = min(mw / w, mh / h, 1.0) if max(w, h) > max(mw, mh) else min(mw / w, mh / h)
-        if abs(scale - 1.0) > 0.02:
-            image = image.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.BILINEAR)
-        photo = ImageTk.PhotoImage(image)
+        # Fit inside the canvas (contain), never stretch — keeps a real rectangle.
+        scale = min(cw / w, ch / h)
+        tw = max(1, int(w * scale))
+        th = max(1, int(h * scale))
+        fitted = image.resize((tw, th), Image.Resampling.BILINEAR)
+        photo = ImageTk.PhotoImage(fitted)
         self._photo_ref = photo
-        self.preview.configure(image=photo, text="")
+        canvas.create_image(cw // 2, ch // 2, image=photo, anchor="center")
 
     def take_photo(self) -> None:
         frame = self.camera.still()
