@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -70,8 +71,13 @@ def remote_revision(opener=urllib.request.urlopen) -> str:
             "Accept": "application/vnd.github+json",
         },
     )
-    with opener(request, timeout=20) as response:
-        payload = json.load(response)
+    try:
+        with opener(request, timeout=20) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(_http_detail("checking for updates", exc)) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach GitHub ({exc.reason}).") from exc
     sha = payload.get("sha")
     if not isinstance(sha, str) or len(sha) < 7:
         raise RuntimeError("GitHub did not return a commit.")
@@ -85,8 +91,22 @@ def check_update(root: Path | None = None, opener=urllib.request.urlopen) -> Upd
 
 def download_archive(opener=urllib.request.urlopen) -> bytes:
     request = urllib.request.Request(ZIP_URL, headers={"User-Agent": "PiCam"})
-    with opener(request, timeout=60) as response:
-        return response.read()
+    try:
+        with opener(request, timeout=60) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(_http_detail("downloading the update", exc)) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach GitHub ({exc.reason}).") from exc
+
+
+def _http_detail(action: str, exc: urllib.error.HTTPError) -> str:
+    if exc.code in {401, 403, 404}:
+        return (
+            f"HTTP {exc.code} while {action}. "
+            "The GitHub repo must be public (or this Pi needs git credentials)."
+        )
+    return f"HTTP {exc.code} while {action}."
 
 
 def apply_archive(root: Path, blob: bytes, sha: str) -> None:
