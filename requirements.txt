@@ -1,0 +1,4 @@
+# On the Pi prefer apt for camera/OpenCV:
+#   sudo apt install -y python3-picamera2 python3-opencv python3-tk python3-pil python3-pil.imagetk python3-numpy
+Pillow>=10.0.0
+numpy>=1.24.0
