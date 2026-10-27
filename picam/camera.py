@@ -6,10 +6,13 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 from PIL import Image
+
+# Prefer 4:3 so the viewfinder looks like a normal photo, not a thin strip.
+_LANDSCAPE = (1296, 972)
+_PORTRAIT = (972, 1296)
 
 
 @dataclass
@@ -31,7 +34,7 @@ class Camera:
         self._record_path: Path | None = None
         self._info = CameraInfo("none", "Camera not opened")
         self._last_frame: Image.Image | None = None
-        self.rotation = 0  # 0, 90, 180, 270 — applied to every grabbed frame
+        self._rotation = 0  # 0, 90, 180, 270
 
     @property
     def info(self) -> CameraInfo:
@@ -40,6 +43,21 @@ class Camera:
     @property
     def recording(self) -> bool:
         return self._recording
+
+    @property
+    def rotation(self) -> int:
+        return self._rotation
+
+    @rotation.setter
+    def rotation(self, degrees: int) -> None:
+        degrees = int(degrees) % 360
+        if degrees not in {0, 90, 180, 270}:
+            degrees = 0
+        with self._lock:
+            if degrees == self._rotation:
+                return
+            self._rotation = degrees
+            # Soft-rotate every frame in software (Pi ISP cannot do 90°).
 
     def open(self) -> CameraInfo:
         with self._lock:
@@ -119,13 +137,13 @@ class Camera:
         try:
             cam = Picamera2()
             config = cam.create_preview_configuration(
-                main={"size": (1280, 720), "format": "RGB888"}
+                main={"size": _LANDSCAPE, "format": "RGB888"}
             )
             cam.configure(config)
             cam.start()
             time.sleep(0.3)
             self._picam = cam
-            self._info = CameraInfo("picamera2", "Raspberry Pi camera")
+            self._info = CameraInfo("picamera2", f"Raspberry Pi camera {_LANDSCAPE[0]}x{_LANDSCAPE[1]}")
             return True
         except Exception as exc:
             self._info = CameraInfo("none", f"picamera2 failed: {exc}")
@@ -141,6 +159,9 @@ class Camera:
             if not cap.isOpened():
                 cap.release()
                 continue
+            # Ask for 4:3 when the driver allows it.
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, _LANDSCAPE[0])
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, _LANDSCAPE[1])
             ok, _ = cap.read()
             if not ok:
                 cap.release()
@@ -156,10 +177,7 @@ class Camera:
         if self._picam is not None:
             try:
                 arr = self._picam.capture_array("main")
-                # Picamera2 RGB888 is already RGB order on recent builds.
-                if arr.ndim == 3 and arr.shape[2] >= 3:
-                    rgb = arr[:, :, :3]
-                    image = Image.fromarray(rgb.copy(), mode="RGB")
+                image = self._array_to_image(arr)
             except Exception:
                 return None
         elif self._cv is not None:
@@ -170,24 +188,32 @@ class Camera:
                 if not ok or frame is None:
                     return None
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                image = Image.fromarray(rgb)
+                image = self._array_to_image(rgb)
             except Exception:
                 return None
         if image is None:
             return None
         return self._apply_rotation(image)
 
+    @staticmethod
+    def _array_to_image(arr: np.ndarray) -> Image.Image | None:
+        if arr is None or arr.ndim != 3 or arr.shape[2] < 3:
+            return None
+        # Picamera2 / OpenCV buffers are HxWxC. Build RGB without relying on
+        # a possibly padded 4th channel.
+        rgb = np.ascontiguousarray(arr[:, :, :3])
+        height, width = rgb.shape[0], rgb.shape[1]
+        image = Image.fromarray(rgb, mode="RGB")
+        if image.size != (width, height):
+            image = image.resize((width, height), Image.Resampling.NEAREST)
+        return image
+
     def _apply_rotation(self, image: Image.Image) -> Image.Image:
-        degrees = int(self.rotation) % 360
+        degrees = int(self._rotation) % 360
         if degrees == 0:
             return image
-        if degrees == 90:
-            return image.transpose(Image.Transpose.ROTATE_90)
-        if degrees == 180:
-            return image.transpose(Image.Transpose.ROTATE_180)
-        if degrees == 270:
-            return image.transpose(Image.Transpose.ROTATE_270)
-        return image.rotate(-degrees, expand=True)
+        # PIL rotate is CCW; expand keeps a true rectangle (no squash).
+        return image.rotate(-degrees, expand=True, resample=Image.Resampling.BILINEAR)
 
     def _open_writer_unlocked(self, path: Path, width: int, height: int, fps: int) -> None:
         try:
@@ -239,7 +265,6 @@ def stitch_panorama(frames: list[Image.Image]) -> Image.Image:
     stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
     status, out = stitcher.stitch(bgrs)
     if status != cv2.Stitcher_OK or out is None:
-        # Fallback: simple side-by-side if stitch fails (not enough overlap).
         heights = [im.size[1] for im in frames]
         h = min(heights)
         resized = [im.convert("RGB").resize((int(im.size[0] * h / im.size[1]), h)) for im in frames]

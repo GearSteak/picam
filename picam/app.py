@@ -213,14 +213,15 @@ class App:
                 if self._gb_live:
                     show = gameboy_frame(frame, lcd_tint=self._gb_lcd, scale=3)
                 self._show_frame(show)
+                tag = f"{show.size[0]}×{show.size[1]}"
                 if self.camera.recording:
-                    self._mode_var.set("Recording…")
+                    self._mode_var.set(f"Recording · {tag}")
                 elif self._pano_mode:
-                    self._mode_var.set(f"Panorama · {len(self._pano_frames)} frames")
+                    self._mode_var.set(f"Pano {len(self._pano_frames)} · {tag}")
                 elif self._gb_live:
-                    self._mode_var.set("Game Boy live")
+                    self._mode_var.set(f"GB live · {tag}")
                 else:
-                    self._mode_var.set("Live")
+                    self._mode_var.set(f"Live · {tag} · {int(self.camera.rotation) % 360}°")
         except Exception as exc:
             self._status_var.set(f"Preview error: {exc}")
         self.root.after(33, self._tick_preview)
@@ -228,6 +229,8 @@ class App:
     def _show_frame(self, image: Image.Image) -> None:
         self._last_preview = image.convert("RGB")
         self._preview_message = ""
+        w, h = self._last_preview.size
+        self._mode_var.set(f"{w}×{h} · rot {int(self.camera.rotation) % 360}°")
         self._redraw_preview()
 
     def _redraw_preview(self) -> None:
@@ -236,8 +239,8 @@ class App:
         cw = max(canvas.winfo_width(), 2)
         ch = max(canvas.winfo_height(), 2)
         canvas.delete("all")
-        canvas.create_rectangle(0, 0, cw, ch, fill="#111", outline="")
-        image = getattr(self, "_last_preview", None)
+        canvas.create_rectangle(0, 0, cw, ch, fill="#1a1a1a", outline="")
+        image = self._last_preview
         if image is None:
             if self._preview_message:
                 canvas.create_text(
@@ -251,14 +254,24 @@ class App:
                 )
             return
         w, h = image.size
-        # Fit inside the canvas (contain), never stretch — keeps a real rectangle.
-        scale = min(cw / w, ch / h)
-        tw = max(1, int(w * scale))
-        th = max(1, int(h * scale))
+        if w < 1 or h < 1:
+            return
+        # Largest rectangle with the frame's true aspect ratio (never stretch).
+        scale = min(cw / float(w), ch / float(h))
+        tw = max(1, int(round(w * scale)))
+        th = max(1, int(round(h * scale)))
+        # Guard against rounding drift that would reintroduce squash.
+        if tw / th > w / h:
+            tw = max(1, int(round(th * (w / h))))
+        else:
+            th = max(1, int(round(tw * (h / w))))
         fitted = image.resize((tw, th), Image.Resampling.BILINEAR)
         photo = ImageTk.PhotoImage(fitted)
         self._photo_ref = photo
-        canvas.create_image(cw // 2, ch // 2, image=photo, anchor="center")
+        x0 = (cw - tw) // 2
+        y0 = (ch - th) // 2
+        canvas.create_rectangle(x0 - 1, y0 - 1, x0 + tw + 1, y0 + th + 1, outline="#333")
+        canvas.create_image(x0, y0, image=photo, anchor="nw")
 
     def take_photo(self) -> None:
         frame = self.camera.still()
